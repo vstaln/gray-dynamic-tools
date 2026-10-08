@@ -1,7 +1,6 @@
 //! gray-dynamic-tools — user-defined shell tools, live-reloaded.
 //!
-//! Port of pi's `dynamic-tools` extension. Where pi registered echo tools at
-//! runtime, this sidecar reads its whole live tool set from
+//! This sidecar reads its live tool set from
 //! `~/.gray/dynamic-tools/*.json` — one file per tool:
 //!
 //! ```json
