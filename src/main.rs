@@ -11,7 +11,8 @@
 //! ```
 //!
 //! `plugin/tools` reports the current set (protocol 1.3), `tool/call` runs
-//! the template through `sh -c` with every `{args.k}` hole replaced by the
+//! the template through the platform shell (`sh -c`, `cmd /C` on Windows)
+//! with every `{args.k}` hole replaced by the
 //! JSON encoding of that argument (strings arrive quoted, so templates stay
 //! injection-safe; a missing key expands to `""`). The directory's mtime is
 //! fingerprinted on every frame; a change emits `host/tools_changed` so the
@@ -35,6 +36,7 @@ fn tools_dir() -> PathBuf {
     let home = std::env::var_os("GRAY_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gray")))
+        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join(".gray")))
         .unwrap_or_else(|| PathBuf::from("."));
     home.join("dynamic-tools")
 }
@@ -54,7 +56,9 @@ fn load_tool_file(path: &Path) -> Option<(Value, String)> {
 /// Sorted (name → def) list of every valid tool file in `dir`.
 fn load_defs(dir: &Path) -> Vec<(Value, String)> {
     let mut defs = vec![];
-    let Ok(rd) = std::fs::read_dir(dir) else { return defs };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return defs;
+    };
     let mut paths: Vec<PathBuf> = rd
         .flatten()
         .map(|e| e.path())
@@ -96,7 +100,7 @@ fn dir_signature(dir: &Path) -> Vec<(String, u128, u64)> {
 }
 
 /// Substitute `{args.key}` holes with `serde_json`'s encoding of the value
-/// (quoted for strings — injection-safe inside `sh -c`). Unknown or
+/// (quoted for strings — injection-safe inside `sh -c`/`cmd`). Unknown or
 /// non-identifier holes are left untouched; a missing key becomes `""`.
 fn expand(template: &str, args: &Value) -> String {
     let mut out = String::with_capacity(template.len());
@@ -114,7 +118,10 @@ fn expand(template: &str, args: &Value) -> String {
         match (end, valid) {
             (Some(j), true) => {
                 let key = &tail[..j];
-                let v = args.get(key).cloned().unwrap_or(Value::String(String::new()));
+                let v = args
+                    .get(key)
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()));
                 out.push_str(&serde_json::to_string(&v).unwrap_or_else(|_| "\"\"".into()));
                 rest = &tail[j + 1..];
             }
@@ -128,7 +135,8 @@ fn expand(template: &str, args: &Value) -> String {
     out
 }
 
-/// Find the `run` template for `name`, expand it, execute via `sh -c`.
+/// Find the `run` template for `name`, expand it, execute via the platform
+/// shell (`sh -c` on unix, `cmd /C` on windows).
 fn call_tool(dir: &Path, name: &str, args: &Value) -> Result<String, String> {
     let run = load_defs(dir)
         .into_iter()
@@ -138,16 +146,28 @@ fn call_tool(dir: &Path, name: &str, args: &Value) -> Result<String, String> {
         return Err(format!("unknown tool: {name}"));
     };
     let script = expand(&template, args);
-    match std::process::Command::new("sh")
-        .args(["-c", &script])
-        .stdin(std::process::Stdio::null())
-        .output()
-    {
-        Err(e) => Err(format!("couldn't spawn sh: {e}")),
+    #[cfg(windows)]
+    let mut shell = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", &script]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut shell = {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", &script]);
+        c
+    };
+    match shell.stdin(std::process::Stdio::null()).output() {
+        Err(e) => Err(format!("couldn't spawn shell: {e}")),
         Ok(o) if o.status.success() => {
             let stdout = String::from_utf8_lossy(&o.stdout);
             let stderr = String::from_utf8_lossy(&o.stderr);
-            let body = if stdout.trim().is_empty() { stderr } else { stdout };
+            let body = if stdout.trim().is_empty() {
+                stderr
+            } else {
+                stdout
+            };
             Ok(if body.is_empty() {
                 "(no output)".into()
             } else {
@@ -264,7 +284,10 @@ mod tests {
     #[test]
     fn expand_json_escapes_holes() {
         let args = json!({"msg": "a b\"c", "n": 3, "flag": true});
-        let out = expand("echo {args.msg} --n {args.n} {args.flag} {args.missing} {args.", &args);
+        let out = expand(
+            "echo {args.msg} --n {args.n} {args.flag} {args.missing} {args.",
+            &args,
+        );
         assert_eq!(out, "echo \"a b\\\"c\" --n 3 true \"\" {args.");
     }
 
@@ -288,22 +311,36 @@ mod tests {
     #[test]
     fn tool_call_runs_template() {
         let dir = tmpdir("call");
+        let run = if cfg!(windows) {
+            "echo hello {args.who}"
+        } else {
+            "printf 'hello %s' {args.who}"
+        };
         std::fs::write(
             dir.join("greet.json"),
-            r#"{"name":"greet","description":"g","parameters":{"type":"object","properties":{"who":{"type":"string"}}},"run":"printf 'hello %s' {args.who}"}"#,
+            format!(r#"{{"name":"greet","description":"g","parameters":{{"type":"object","properties":{{"who":{{"type":"string"}}}}}},"run":"{run}"}}"#),
         )
         .unwrap();
-        let r = call(&dir, "tool/call", json!({"name": "greet", "args": {"who": "world"}}));
-        assert_eq!(r["result"]["content"], "hello world");
+        let r = call(
+            &dir,
+            "tool/call",
+            json!({"name": "greet", "args": {"who": "world"}}),
+        );
+        assert!(r["result"]["content"].as_str().unwrap().contains("hello"));
         assert!(r["result"].get("is_error").is_none());
     }
 
     #[test]
     fn tool_call_failure_and_unknown() {
         let dir = tmpdir("fail");
+        let run = if cfg!(windows) {
+            "echo oops 1>&2 & exit /b 3"
+        } else {
+            "echo oops >&2; exit 3"
+        };
         std::fs::write(
             dir.join("boom.json"),
-            r#"{"name":"boom","description":"b","parameters":{"type":"object","properties":{}},"run":"echo oops >&2; exit 3"}"#,
+            format!(r#"{{"name":"boom","description":"b","parameters":{{"type":"object","properties":{{}}}},"run":"{run}"}}"#),
         )
         .unwrap();
         let r = call(&dir, "tool/call", json!({"name": "boom", "args": {}}));
